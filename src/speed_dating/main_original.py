@@ -7,7 +7,6 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch import nn, optim, autograd
-from MLP_model import MLP
 
 parser = argparse.ArgumentParser(description='SpeedDATING')
 parser.add_argument('--hidden_dim', type=int, default=200)
@@ -18,9 +17,7 @@ parser.add_argument('--penalty_anneal_iters', type=int, default=100)
 parser.add_argument('--penalty_weight', type=float, default=10000.0)
 parser.add_argument('--steps', type=int, default=100)
 parser.add_argument('--env', type=int, default=22)
-# parser.add_argument('--env', type=int, default=0)
-# parser.add_argument('--collider', type=int, default=1)
-parser.add_argument('--collider', type=int, default=0)
+parser.add_argument('--collider', type=int, default=1)
 parser.add_argument('--num_col', type=int, default=0)
 parser.add_argument('--mod', type=str, default='mod4')
 parser.add_argument('--dimension', type=str, default='high')
@@ -29,7 +26,6 @@ parser.add_argument('--net', type=str, default='tarnet')
 parser.add_argument('--gpu', type=int, default=1)
 parser.add_argument('--icp', type=int, default=1)
 parser.add_argument('--all_train', type=int, default=0)
-# parser.add_argument('--all_train', type=int, default=1)
 parser.add_argument('--data_base_dir', type=str, default='')
 parser.add_argument('--output_base_dir', type=str, default='')
 
@@ -44,8 +40,6 @@ final_test_accs = []
 
 final_train_ate = []
 final_test_ate = []
-final_test_ate_error = []
-final_train_ate_error = []
 final_train_treatment_acc=[]
 final_test_treatment_acc=[]
 
@@ -68,52 +62,108 @@ truth = {
     'high': reader['high_ate'].values
 }
 
-# print("data", data.shape) #(6000, 187)
-# rows: different data, columns: Y, A(our T), 185 covariates
+Y = data[:, 0].reshape(-1, 1)
+T = data[:, 1].reshape(-1, 1)
+X = data[:, 2:]
+index = X[:, flags.env].argsort()
+X = np.delete(X, flags.env, axis=1)
 
-Y = data[:, 0].reshape(-1, 1) # (6000, 1)
-T = data[:, 1].reshape(-1, 1) # (6000, 1)
-X = data[:, 2:] # (6000, 185)
+share = int(index.shape[0] / 3)
+env1 = index[:share]
+env2 = index[share:share * 2]
+env3 = index[share * 2: share * 3]
 
-# turn one covariate into environments, and delete the covariate from our known information
-# index = X[:, flags.env].argsort() # (6000, )
-# X = np.delete(X, flags.env, axis=1)
 
-def prepare_data(X, Y, T, ITE_oracle):
+# Build environments
+def make_environment(X, Y, T, ITE_oracle, env, e):
+    if flags.collider == 1:
+        X = X[env]
+        for i in range(flags.num_col):
+            np.random.seed(i)
+            col_1 = Y[env] + T[env] + np.random.normal(0, e, len(env)).reshape(-1, 1)
+            X[:, -(i + 1)] = np.squeeze(col_1)
+    else:
+        X = X[env]
+#for runing with gpu & cpu
     if flags.gpu == 1:
         return {
             'covariates': torch.from_numpy(X).cuda(),
-            'outcome': torch.from_numpy(Y).cuda(),
-            'treatment': torch.from_numpy(T).cuda(),
-            'ITE_oracle': torch.from_numpy(ITE_oracle)
+            'outcome': torch.from_numpy(Y[env]).cuda(),
+            'treatment': torch.from_numpy(T[env]).cuda(),
+            'ITE_oracle': torch.from_numpy(ITE_oracle[env])
         }
     else:
         return {
             'covariates': torch.from_numpy(X),
-            'outcome': torch.from_numpy(Y),
-            'treatment': torch.from_numpy(T),
-            'ITE_oracle': torch.from_numpy(ITE_oracle)
+            'outcome': torch.from_numpy(Y[env]),
+            'treatment': torch.from_numpy(T[env]),
+            'ITE_oracle': torch.from_numpy(ITE_oracle[env])
         }
 
-def split_data(X, Y, T, ITE_oracle, train_split = 0.75):
-    data_num = data.shape[0]
-    train_num = int(data_num*train_split)
-    test_num = data_num - train_num
-    # print("X[:train_num]: ", X[:train_num].shape) # (4500, 185)
-    # print("X[train_num:]: ", X[train_num:].shape) # (1500, 185)
-    train_env = prepare_data(X[:train_num], Y[:train_num], T[:train_num], ITE_oracle[:train_num])
-    test_env = prepare_data(X[train_num:], Y[train_num:], T[train_num:], ITE_oracle[train_num:])
-    return train_env, test_env
 
-train_env, test_env = split_data(X, Y, T, ITE_oracle, train_split = 0.75)
-dataloaders = {
-    "train": train_env,
-    "test": test_env
-}
+envs = [
+    make_environment(X, Y, T, ITE_oracle,  env1, .01),
+    make_environment(X, Y, T, ITE_oracle,  env2, .2),
+    make_environment(X, Y, T, ITE_oracle, env3, 1),
+]
 
 
-# create MLP model
-mlp = MLP(X.shape[1], flags)
+# # Define and instantiate the model
+class MLP(nn.Module):
+    def __init__(self, dim):
+        super(MLP, self).__init__()
+        hidden_dim = flags.hidden_dim
+        hypo_dim = 100
+        self.lin1 = nn.Linear(dim, hidden_dim)
+        self.lin1_1 = nn.Linear(hidden_dim, hidden_dim)
+        self.lin1_2 = nn.Linear(hidden_dim, hypo_dim)
+        # tarnet
+        if flags.net =='tarnet':
+            self.lin1_3 = nn.Linear(dim, 1)
+        else:
+            self.lin1_3 = nn.Linear(hypo_dim, 1)
+
+        self.lin2_0 = nn.Linear(hypo_dim, hypo_dim)
+        self.lin2_1 = nn.Linear(hypo_dim, hypo_dim)
+
+        self.lin3_0 = nn.Linear(hypo_dim, hypo_dim)
+        self.lin3_1 = nn.Linear(hypo_dim, hypo_dim)
+
+        self.lin4_0 = nn.Linear(hypo_dim, 1)
+        self.lin4_1 = nn.Linear(hypo_dim, 1)
+
+        for lin in [self.lin1, self.lin1_1, self.lin1_2, self.lin2_0, self.lin2_1, self.lin1_3, self.lin3_0,
+                    self.lin3_1, self.lin4_0, self.lin4_1]:
+            nn.init.xavier_uniform_(lin.weight)
+            nn.init.zeros_(lin.bias)
+
+    def forward(self, input):
+        initial = input.view(input.shape)
+
+        x = F.relu(self.lin1(initial))
+        x = F.relu(self.lin1_1(x))
+        x = F.relu(self.lin1_2(x))
+        x = F.relu(x)
+        if flags.net == 'tarnet':
+            t = self.lin1_3(initial)
+        else:
+            t = self.lin1_3(x)
+
+        h1 = F.relu(self.lin2_1(x))
+        h0 = F.relu(self.lin2_0(x))
+
+        h1 = F.relu(h1)
+        h0 = F.relu(h0)
+
+        h0 = F.relu(self.lin3_0(h0))
+        h1 = F.relu(self.lin3_1(h1))
+
+        h0 = self.lin4_0(h0)
+        h1 = self.lin4_1(h1)
+        return torch.cat((h0, h1, t), 1)
+
+
+mlp = MLP(X.shape[1])
 if flags.gpu==1:
     mlp.cuda()
 else:
@@ -125,7 +175,6 @@ def mean_nll(y_logit, y):
     return nn.functional.binary_cross_entropy_with_logits(y_logit, y.float())
 
 def mean_accuracy(y_logit, y):
-    # check correct binary -- for T and Y
     preds = (y_logit > 0.).double()
     return ((preds - y).abs() < 1e-2).float().mean()
 
@@ -156,18 +205,17 @@ def pretty_print(*values):
     str_values = [format_val(v) for v in values]
     print("   ".join(str_values))
 
-pretty_print('step', 'train nll', 'train acc', 'train penalty', 'test acc', 'train_ate', 'train_ate_error', 'test_ate', 'test_ate_error', 'train_t_acc',
+
+pretty_print('step', 'train nll', 'train acc', 'train penalty', 'test acc', 'train_ate', 'test_ate', 'train_t_acc',
              'test_t_acc')
 
-def train_dataloader(val, dataloaders, all_train=1):
+
+def train_stack(val, env, all_train=True):
     if all_train == 1:
-        if dataloaders["train"][val].dim() == 0:
-            return torch.stack((dataloaders["train"][val], dataloaders["test"][val])).mean()
-        else: 
-            # TODO: verify if this looks correct to get mean
-            return torch.cat((dataloaders["train"][val], dataloaders["test"][val])).mean()
-    else: # train_test split
-        return dataloaders["train"][val].mean() 
+        return torch.stack([env[0][val], env[1][val], env[2][val]]).mean()
+    else:
+        return torch.stack([env[0][val], env[1][val]]).mean()
+
 
 #different choice of optimizer yields different performance.
 optimizer_adam = optim.Adam(mlp.parameters(), lr=flags.lr)
@@ -175,40 +223,31 @@ optimizer_sgd = optim.SGD(mlp.parameters(), lr=1e-7, momentum=0.9)
 
 # training loop
 for step in range(flags.steps):
-    for setting, single_env in dataloaders.items():
-        # print("setting: ", setting)
-        # print("single_env: ", single_env.keys())
-        
-        logits = mlp(single_env['covariates'].float())
+    for env in envs:
+        logits = mlp(env['covariates'].float())
         y0_logit = logits[:, 0].unsqueeze(1)
         y1_logit = logits[:, 1].unsqueeze(1)
         t_logit = logits[:, 2].unsqueeze(1)
-        t = single_env['treatment'].float()
-        # print("y0_logit: ", y0_logit.shape) # (1500, 1) # (4500, 1)
-        # print("y1_logit: ", y1_logit.shape) # (1500, 1) # (4500, 1)
-        # print("t_logit: ", t_logit.shape) # (1500, 1) # (4500, 1)
-        # print("t: ", t.shape) # (1500, 1) # (4500, 1)
+        t = env['treatment'].float()
         y_logit = t * y1_logit + (1 - t) * y0_logit
 
-        single_env['ite'] = ite(y0_logit, y1_logit)
+        env['ite'] = ite(y0_logit, y1_logit)
 
-        single_env['nll'] = mean_nll(y_logit, single_env['outcome'])
-        single_env['t_nll'] = mean_nll(t_logit, t)
+        env['nll'] = mean_nll(y_logit, env['outcome'])
+        env['t_nll'] = mean_nll(t_logit, t)
 
-        # check if identify T and Y with correct 0 or 1 -- binary treatment, binary outcome
-        single_env['acc'] = mean_accuracy(y_logit, single_env['outcome'])
-        single_env['t_acc'] = mean_accuracy(t_logit, single_env['treatment'])
-        # TODO: what is this additional penalty
-        single_env['penalty'] = penalty(y_logit, single_env['outcome'])
+        env['acc'] = mean_accuracy(y_logit, env['outcome'])
+        env['t_acc'] = mean_accuracy(t_logit, env['treatment'])
+        env['penalty'] = penalty(y_logit, env['outcome'])
 
-    train_nll = train_dataloader('nll', dataloaders, all_train=flags.all_train)
-    train_t_nll = train_dataloader('t_nll', dataloaders, all_train=flags.all_train)
-    train_acc = train_dataloader('acc', dataloaders, all_train=flags.all_train)
-    train_t_acc = train_dataloader('t_acc', dataloaders, all_train=flags.all_train)
+    all_train = flags.all_train
+    train_nll = train_stack('nll', envs, all_train=all_train)
+    train_t_nll = train_stack('t_nll', envs, all_train=all_train)
+    train_acc = train_stack('acc', envs, all_train=all_train)
+    train_t_acc = train_stack('t_acc', envs, all_train=all_train)
 
-    train_ate = train_dataloader('ite', dataloaders, all_train=flags.all_train)
-    train_penalty = train_dataloader('penalty', dataloaders, all_train=flags.all_train)
-
+    train_ate = train_stack('ite', envs, all_train=all_train)
+    train_penalty = train_stack('penalty', envs, all_train=all_train)
     if flags.gpu == 1:
         weight_norm = torch.tensor(0.).cuda()
     else:
@@ -236,24 +275,13 @@ for step in range(flags.steps):
         optimizer_sgd.zero_grad()
         loss.backward()
         optimizer_sgd.step()
-    
-    test_acc = dataloaders["test"]['acc']
-    test_t_acc = dataloaders["test"]['t_acc']
-    test_ate = dataloaders["test"]['ite'].mean()
 
-    pred_ite = dataloaders["test"]['ite'].detach().cpu().numpy()
-    true_ite = dataloaders["test"]['ITE_oracle'].detach().cpu().numpy()
+    test_acc = envs[2]['acc']
+    test_t_acc = envs[2]['t_acc']
+    test_ate = envs[2]['ite'].mean()
 
-    test_ate_error = abs(test_ate - true_ite.mean())
-    train_ate_error = abs(train_ate - dataloaders["train"]['ITE_oracle'].detach().cpu().numpy().mean())
-
-
-    # test_acc = envs[2]['acc']
-    # test_t_acc = envs[2]['t_acc']
-    # test_ate = envs[2]['ite'].mean()
-
-    # pred_ite = torch.stack([envs[0]['ite'], envs[1]['ite'], envs[2]['ite']]).detach().cpu().numpy()
-    # true_ite = torch.stack([envs[0]['ITE_oracle'], envs[1]['ITE_oracle'], envs[2]['ITE_oracle']]).detach().cpu().numpy()
+    pred_ite = torch.stack([envs[0]['ite'], envs[1]['ite'], envs[2]['ite']]).detach().cpu().numpy()
+    true_ite = torch.stack([envs[0]['ITE_oracle'], envs[1]['ITE_oracle'], envs[2]['ITE_oracle']]).detach().cpu().numpy()
 
     if step % 100 == 0:
         pretty_print(
@@ -263,12 +291,9 @@ for step in range(flags.steps):
             train_penalty.detach().cpu().numpy(),
             test_acc.detach().cpu().numpy(),
             np.mean(train_ate.detach().cpu().numpy()),
-            train_ate_error.detach().cpu().numpy(),
             np.mean(test_ate.detach().cpu().numpy()),
-            test_ate_error.detach().cpu().numpy(),
             train_t_acc.detach().cpu().numpy(),
-            test_t_acc.detach().cpu().numpy(),
-
+            test_t_acc.detach().cpu().numpy()
         )
 final_time = time.time()
 
@@ -280,9 +305,6 @@ final_test_treatment_acc.append(test_t_acc.detach().cpu().numpy())
 
 final_train_ate.append(train_ate.detach().cpu().numpy())
 final_test_ate.append(test_ate.detach().cpu().numpy())
-final_test_ate_error.append(test_ate_error.detach().cpu().numpy())
-final_train_ate_error.append(train_ate_error.detach().cpu().numpy())
-
 
 # print('Final train acc (mean/std across restarts so far):')
 # print(np.mean(final_train_accs), np.std(final_train_accs))
@@ -302,16 +324,14 @@ final_train_ate_error.append(train_ate_error.detach().cpu().numpy())
 saver = {
     'pred_ite': [pred_ite],
     'sample_ite': [true_ite],
-    'Y': single_env['outcome'].detach().cpu().numpy(),
-    'T': single_env['treatment'].detach().cpu().numpy(),
-    # 'index': [index]
+    'Y': torch.stack([envs[0]['outcome'], envs[1]['outcome'], envs[2]['outcome']]).detach().cpu().numpy(),
+    'T': torch.stack([envs[0]['treatment'], envs[1]['treatment'], envs[2]['treatment']]).detach().cpu().numpy(),
+    'index': [index]
 }
 if flags.net=='tarnet':
     tmp = os.path.join(flags.output_base_dir, 'tarnet/')
-elif flags.net=='dragon':
+else:
     tmp = os.path.join(flags.output_base_dir, 'dragon/')
-elif flags.net == 'tarnet_single':
-    tmp = os.path.join(flags.output_base_dir, 'tarnet_single/')
 
 if flags.collider==1:
     tmp = os.path.join(tmp, 'collider/')
@@ -342,9 +362,7 @@ final_output = pd.DataFrame({
     'test_ate': final_test_ate,
     'train_treatment_acc': final_train_treatment_acc,
     'test_treatment_acc': final_test_treatment_acc,
-    'PEHE': np.square(pred_ite - true_ite).mean(),
-    'final_test_ate_error': final_test_ate_error,
-    'final_train_ate_error': final_train_ate_error
+    'PEHE': np.square(pred_ite - true_ite).mean()
 })
 
 

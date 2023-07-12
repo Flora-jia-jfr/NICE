@@ -428,6 +428,3 @@ for (i in 1:niter){
  temp <- psi0.mod4
  write.csv(data.frame(temp), file= paste0(file_path, "ate_truth.csv"), row.names= FALSE)
  write.csv(data.frame(low_ite, med_ite, high_ite), file = paste0(file_path, "ite_truth.csv"), row.names = FALSE)
-
-
-			

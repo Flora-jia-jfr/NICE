@@ -13,7 +13,7 @@ L2=0.0001
 LR=0.001
 STEPS=501
 N_COL=20
-NET=tarnet
+NET=tarnet_single
 
 mods=(
     Mod1
@@ -33,7 +33,7 @@ for i in {1..10}; do
     for mod in ${mods[@]}; do
         for dim in ${dims[@]}; do
             echo "IRM Collider:"
-            python -u main.py \
+            python3 -u main_original.py \
               --hidden_dim=$HIDDEN_DIM \
               --l2_regularizer_weight=$L2 \
               --lr=$LR \
@@ -50,7 +50,7 @@ for i in {1..10}; do
               --output_base_dir $OUTPUT_DIR
 ##
             echo "ERM Collider:"
-            python -u main.py \
+            python3 -u main_original.py \
               --hidden_dim=$HIDDEN_DIM  \
               --l2_regularizer_weight=$L2 \
               --lr=$LR\
@@ -67,7 +67,7 @@ for i in {1..10}; do
               --output_base_dir $OUTPUT_DIR
 
              echo "IRM no collider:"
-            python -u main.py \
+            python3 -u main_original.py \
               --hidden_dim=$HIDDEN_DIM \
               --l2_regularizer_weight=$L2 \
               --lr=$LR\
@@ -84,7 +84,7 @@ for i in {1..10}; do
               --output_base_dir $OUTPUT_DIR
 ##
             echo "ERM no collider:"
-            python -u main.py \
+            python3 -u main_original.py \
               --hidden_dim=$HIDDEN_DIM  \
               --l2_regularizer_weight=$L2 \
               --lr=$LR\
